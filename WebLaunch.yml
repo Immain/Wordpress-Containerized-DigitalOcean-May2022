@@ -1,0 +1,248 @@
+- hosts: localhost
+  vars_prompt:
+    - name: ansible_password
+      prompt: Enter password
+      unsafe: yes
+      private: yes
+  tasks:
+  - name: add public ssh key to digitalocean account
+    digital_ocean_sshkey:
+      name: 
+      oauth_token: Digital Ocean Oauth Token
+      ssh_pub_key: "{{lookup('file', '~/.ssh/id_rsa.pub') }}"
+      state: present
+    register: sshkey_result
+
+  - name: create a new droplet assigning the key
+    digital_ocean_droplet:
+      name: "{{ item }}"
+      oauth_token: Digital Ocean Oauth Token
+      size_id: s-2vcpu-2gb-amd
+      region: sfo3
+      image: lamp-20-04
+      wait_timeout: 700
+      unique_name: yes
+      ssh_keys: ["{{ sshkey_result.data.ssh_key.id }}"]      
+      state: present
+    with_inventory_hostnames:
+      - web
+    register: droplet_result
+
+  - name: Save IP and hostname to local hosts file /etc/hosts
+    become: yes
+    lineinfile:
+      path: /etc/hosts
+      regexp: '.*{{ item.data.droplet.name }}$'
+      line: "{{ item.data.ip_address }}  {{ item.data.droplet.name }}"
+    with_items: "{{ droplet_result.results }}"
+
+  - name: Pause for 2 Minutes to let Droplet load
+    pause:
+      minutes: 2
+
+- hosts: web
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+# Ubuntu Update 
+  - name: Update and upgrade apt packages
+    apt: update_cache=yes force_apt_get=yes cache_valid_time=3600
+
+  - name: Install required system packages
+    apt:
+      pkg:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - software-properties-common
+        - python3-pip
+        - virtualenv
+        - python3-setuptools
+      state: latest
+      update_cache: true
+
+# Docker Setup
+  - name: Add Docker GPG apt Key
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      state: present
+
+  - name: add docker repository to apt
+    apt_repository:
+      repo: deb https://download.docker.com/linux/ubuntu bionic stable
+      state: present
+
+  - name: install docker
+    apt:
+      name: "{{item}}"
+      state: latest
+      update_cache: yes
+    loop:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+
+  - name: Start and Enable Docker
+    service:
+      name: docker
+      state: started
+      enabled: yes
+
+  - name: Install Docker Module for Python
+    pip:
+      name: docker
+
+# Portainer Agent Container Setup 
+  - name: Pull Portainer Agent Image from Docker
+    docker_image:
+      name: portainer/agent
+      source: pull
+
+  - name: Create Portainer Agent
+    docker_container:
+      name: portaineragent
+      image: portainer/agent
+      state: started
+      recreate: yes
+      restart_policy: always
+      published_ports:
+        - "9001:9001"
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+        - /var/lib/docker/volumes:/var/lib/docker/volumes  
+
+  - name: Open Portainer port
+    ufw:
+      state: enabled
+      rule: allow
+      port: "9001"
+      proto: tcp
+
+# Add Docker-Compose
+  - name: Add Docker-Compose
+    pip:
+      name: docker-compose
+  
+  - name: Create File Directory for Compose
+    file:
+      path: ~/ansible/compose_files/{{ item }}
+      state: directory
+    with_items:
+      - proxy-manager
+      - wordpress-stack
+
+# Proxy Manager Compose Stack
+  - name: Creating Proxy Manager Compose Stack
+    copy:
+      dest: "~/ansible/compose_files/proxy-manager/compose.yml"
+      content: |
+        version: "3"
+        services:
+          app:
+            image: 'jc21/nginx-proxy-manager:latest'
+            restart: unless-stopped
+            ports:
+              - '8080:8080' # Public HTTP Port
+              - '443:443' # Public HTTPS Port
+              - '81:81' # Admin Web Port
+            volumes:
+              - /data:/data
+              - /letsencrypt:/etc/letsencrypt
+
+  - name: Deploy Nginx Proxy Manager Docker Compose stack
+    docker_compose:
+     project_src: ~/ansible/compose_files/proxy-manager
+     files:
+     - compose.yml
+
+  - name: Open Ports For Proxy Manager
+    ufw:
+      state: enabled
+      rule: allow
+      port: "{{ item }}"
+      proto: tcp
+    loop:
+      - '8080'
+      - '81'
+      - '443'
+
+# Wordpress Compose Stack
+  - name: Creating Wordpress Docker Compose Stack
+    copy:
+      dest: "~/ansible/compose_files/wordpress-stack/compose.yml"
+      content: |
+        version: "3"
+        services:
+          mariadb:
+            image: 'mariadb'
+            restart: always
+            ports:
+              - '3307:3306'
+            environment:
+              MYSQL_ROOT_PASSWORD: SomePassword123
+              MYSQL_DATABASE: testwebdb
+              MYSQL_USER: adminuser
+              MYSQL_PASSWORD: SomePassword123
+            volumes:
+              - /var/lib/mysql
+          wordpress:
+            depends_on:
+              - mariadb
+            image: 'wordpress:latest'
+            restart: always
+            ports:
+              - '8007:80'
+            environment:
+              WORDPRESS_DB_HOST: mariadb
+              WORDPRESS_DB_USER: adminuser
+              WORDPRESS_DB_PASSWORD: SomePassword123
+              WORDPRESS_DB_NAME: testwebdb
+            volumes:
+              - /var/www/html
+
+  - name: Deploy WordPress
+    docker_compose:
+     project_src: ~/ansible/compose_files/wordpress-stack
+     files:
+     - compose.yml
+
+  - name: Open Ports For WordPress
+    ufw:
+      state: enabled
+      rule: allow
+      port: "{{ item }}"
+      proto: tcp
+    loop:
+      - '8007'
+
+# Get IP Address For Email Output
+
+  - name: get public IP
+    ipify_facts:
+    register: public_ip
+
+# Send Email To Customer
+  - name: Sending E-Mail On Completion
+    mail:
+      host: smtp.gmail.com
+      port: 587
+      username: user@gmail.com
+      password: SomePassword123
+      to: usersEmail@user.com
+      subject: Website | Ansible-Report
+      body:
+        <h3>Welcome To Company Name Hosting, But Most of All, Welcome to Your New Website,</h3>
+        <img src=https://media0.giphy.com/media/fU4elxKlRsulB4Jy7w/200.gif>
+        <p>Thank you for choosing <strong>Company Name</strong> as your hosting provider, we are greatly humbled.</p>
+        <p>Your Website (<strong>{{ inventory_hostname }}</strong>) at <strong>{{ ipify_public_ip }}</strong> has been successfully provisioned.</p>        
+        <p> <strong>Your Login Username:</strong></p>
+        <p> <strong>Your Temporary Password:</strong></p>
+        <p> if you need further help setting up your site, please send us an email at <a href="mailto:user@domain.com"><strong>user@domain.com</strong></a></p>        
+        <p> This message has been pre-generated and cannot be replied to, thank you for choosing <strong>Company Name</strong></p>
+
+        <h4>Sincerely,</h4>
+        <h4>Company Name Support Team</h4>
+        <img src=companylogo.jpg>
+      subtype: html
+      charset: utf8
+    delegate_to: localhost
